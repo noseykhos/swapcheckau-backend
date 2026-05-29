@@ -32,28 +32,18 @@ async function getEbayToken() {
   }
 }
 
-const AU_STRICT_FILTER = [
-  'buyingOptions:{FIXED_PRICE}',
-  'itemLocationCountry:AU',
-  'conditions:{NEW}',
-  'deliveryCountry:AU',
-  'currency:AUD',
-].join(',');
+const AU_FILTER = 'buyingOptions:{FIXED_PRICE},itemLocationCountry:AU,currency:AUD';
 
-const AU_SUGGEST_FILTER = [
-  'buyingOptions:{FIXED_PRICE}',
-  'itemLocationCountry:AU',
-  'currency:AUD',
-].join(',');
-
-function isRelevantItem(title) {
-  const t = title.toLowerCase();
-  if (!t.includes('pokemon') && !t.includes('pokémon')) return false;
-  const junk = ['single', 'lot of', 'damaged', 'played', 'heavy played', 'lightly played', 'nm/', 'psa', 'bgs', 'cgc'];
-  for (const j of junk) { if (t.includes(j)) return false; }
-  return true;
+// Clean and normalise a product title to a short readable name
+function cleanTitle(title) {
+  return title
+    .replace(/\b(brand new|sealed|new|au stock|free postage|fast shipping|australia|factory)\b/gi, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 60);
 }
 
+// ─── Suggest — returns ONE entry per unique product type ───
 app.get('/api/suggest', async (req, res) => {
   const query = req.query.q;
   if (!query || query.length < 2) return res.json({ suggestions: [] });
@@ -63,39 +53,56 @@ app.get('/api/suggest', async (req, res) => {
       'https://api.ebay.com/buy/browse/v1/item_summary/search',
       {
         params: {
-          q: `pokemon tcg ${query} sealed`,
-          filter: AU_SUGGEST_FILTER,
-          limit: 12,
+          q: `pokemon ${query}`,
+          filter: AU_FILTER,
+          limit: 20,
           sort: 'bestMatch',
         },
         headers: {
           'Authorization': `Bearer ${token}`,
           'X-EBAY-C-MARKETPLACE-ID': 'EBAY_AU',
-          'Accept-Language': 'en-AU',
         },
       }
     );
-    const items = (response.data.itemSummaries || []).filter(i => isRelevantItem(i.title));
-    const seen = new Set();
-    const suggestions = [];
+
+    const items = response.data.itemSummaries || [];
+
+    // Group by similar title — deduplicate aggressively
+    // Strip noise words and compare first 35 chars
+    const groups = {};
     for (const item of items) {
-      const key = item.title.toLowerCase().replace(/[^a-z0-9 ]/g, '').slice(0, 45);
-      if (!seen.has(key)) {
-        seen.add(key);
-        suggestions.push({
-          name: item.title,
-          price: parseFloat(item.price?.value || 0),
+      const cleaned = cleanTitle(item.title);
+      const key = cleaned.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 35);
+      if (!groups[key]) {
+        groups[key] = {
+          name: cleaned,
+          prices: [],
           image: item.image?.imageUrl || null,
-        });
+        };
       }
+      const price = parseFloat(item.price?.value || 0);
+      if (price > 0) groups[key].prices.push(price);
     }
-    res.json({ suggestions: suggestions.slice(0, 6) });
+
+    // Build suggestion list — one per unique product
+    const suggestions = Object.values(groups)
+      .filter(g => g.prices.length > 0)
+      .map(g => ({
+        name: g.name,
+        avgPrice: (g.prices.reduce((a, b) => a + b, 0) / g.prices.length).toFixed(2),
+        listings: g.prices.length,
+        image: g.image,
+      }))
+      .slice(0, 6);
+
+    res.json({ suggestions });
   } catch (err) {
     console.error('Suggest error:', err.response?.data || err.message);
     res.status(500).json({ error: 'Suggestions failed' });
   }
 });
 
+// ─── Price data — aggregated AU Buy It Now prices ───
 app.get('/api/sold', async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: 'Query required' });
@@ -106,62 +113,59 @@ app.get('/api/sold', async (req, res) => {
       {
         params: {
           q: query,
-          filter: AU_STRICT_FILTER,
+          filter: AU_FILTER,
           sort: 'newlyListed',
           limit: 25,
         },
         headers: {
           'Authorization': `Bearer ${token}`,
           'X-EBAY-C-MARKETPLACE-ID': 'EBAY_AU',
-          'Accept-Language': 'en-AU',
         },
       }
     );
+
     const rawItems = response.data.itemSummaries || [];
+
+    // Strict filter — Buy It Now only, no auctions, no best offer, AUD, AU seller
     const items = rawItems.filter(item => {
       const options = item.buyingOptions || [];
-      const hasFixed = options.includes('FIXED_PRICE');
-      const hasAuction = options.includes('AUCTION');
-      const hasBestOffer = options.includes('BEST_OFFER');
-      const currency = item.price?.currency;
-      const location = item.itemLocation?.country;
-      return hasFixed && !hasAuction && !hasBestOffer && currency === 'AUD' && location === 'AU';
+      return (
+        options.includes('FIXED_PRICE') &&
+        !options.includes('AUCTION') &&
+        item.price?.currency === 'AUD' &&
+        item.itemLocation?.country === 'AU'
+      );
     });
+
     if (!items.length) {
-      return res.json({
-        name: query,
-        lastSold: null,
-        avg: null,
-        high: null,
-        low: null,
-        sales: 0,
-        trend: 'unknown',
-        recentSales: [],
-        note: 'No Buy It Now AU listings found for this product.'
-      });
+      return res.json({ name: query, lastSold: null, avg: null, high: null, low: null, sales: 0, trend: 'unknown', recentSales: [] });
     }
+
     const prices = items.map(i => parseFloat(i.price?.value || 0)).filter(p => p > 0);
     const avg = prices.reduce((a, b) => a + b, 0) / prices.length;
     const high = Math.max(...prices);
     const low = Math.min(...prices);
-    const firstHalf = prices.slice(0, Math.floor(prices.length / 2));
-    const secondHalf = prices.slice(Math.floor(prices.length / 2));
-    const firstAvg = firstHalf.reduce((a, b) => a + b, 0) / (firstHalf.length || 1);
-    const secondAvg = secondHalf.reduce((a, b) => a + b, 0) / (secondHalf.length || 1);
+
+    // Trend
+    const mid = Math.floor(prices.length / 2);
+    const recentAvg = prices.slice(0, mid).reduce((a, b) => a + b, 0) / (mid || 1);
+    const olderAvg = prices.slice(mid).reduce((a, b) => a + b, 0) / (prices.slice(mid).length || 1);
     let trend = 'stable';
-    if (firstAvg > secondAvg * 1.05) trend = 'up';
-    else if (firstAvg < secondAvg * 0.95) trend = 'down';
-    const recentSales = items.slice(0, 6).map(item => ({
-      title: item.title,
+    if (recentAvg > olderAvg * 1.05) trend = 'up';
+    else if (recentAvg < olderAvg * 0.95) trend = 'down';
+
+    // Recent sales — clean titles
+    const recentSales = items.slice(0, 5).map(item => ({
+      title: cleanTitle(item.title),
       price: parseFloat(item.price?.value || 0),
       buyingOption: 'Buy It Now',
-      location: item.itemLocation?.city || 'Australia',
       date: item.itemCreationDate
         ? new Date(item.itemCreationDate).toLocaleDateString('en-AU', { day: 'numeric', month: 'short', year: 'numeric' })
         : 'Recent',
       image: item.image?.imageUrl || null,
       url: item.itemWebUrl,
     }));
+
     res.json({
       name: query,
       lastSold: parseFloat(prices[0].toFixed(2)),
@@ -171,19 +175,18 @@ app.get('/api/sold', async (req, res) => {
       sales: prices.length,
       trend,
       recentSales,
-      dataType: 'BUY_IT_NOW_AU_ONLY',
     });
   } catch (err) {
     console.error('Sold error:', err.response?.data || err.message);
-    res.status(500).json({ error: 'Failed to fetch price data', details: err.message });
+    res.status(500).json({ error: 'Failed to fetch price data' });
   }
 });
 
+// ─── Health ───
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', app: 'SwapCheckAU', version: '1.1.0', filters: 'BUY_IT_NOW_AU_AUD_NEW_ONLY' });
+  res.json({ status: 'ok', app: 'SwapCheckAU', version: '1.2.0' });
 });
 
 app.listen(PORT, () => {
-  console.log(`SwapCheckAU backend v1.1 running on port ${PORT}`);
-  console.log('Filters: Buy It Now | AU sellers | AUD only | New/Sealed');
+  console.log(`SwapCheckAU backend v1.2 running on port ${PORT}`);
 });
