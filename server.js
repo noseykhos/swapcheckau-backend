@@ -34,13 +34,34 @@ async function getEbayToken() {
 
 const AU_FILTER = 'buyingOptions:{FIXED_PRICE},itemLocationCountry:AU,currency:AUD';
 
-// Clean and normalise a product title to a short readable name
+// Clean and normalise a product title
 function cleanTitle(title) {
   return title
     .replace(/\b(brand new|sealed|new|au stock|free postage|fast shipping|australia|factory)\b/gi, '')
     .replace(/\s+/g, ' ')
     .trim()
     .slice(0, 60);
+}
+
+// Filter out junk listings that aren't the exact product
+// e.g. "lot of 2", "x2", "in hand", "5% off", "ME 2.5", bundles of multiple
+function isJunkListing(title) {
+  const t = title.toLowerCase();
+  const junkPatterns = [
+    /\blot of \d+/,          // lot of 2, lot of 5
+    /\bx\d+\b/,              // x2, x3, x4
+    /\d+x\b/,                // 2x, 4x
+    /\bin hand\b/,           // in hand
+    /\bpre.?order\b/,        // pre-order
+    /\b\d+\s*%\s*off\b/,    // 5% off, 10% off
+    /\bme \d+\.\d+\b/,      // ME 2.5
+    /\bmega evolution\b/,    // Mega Evolution bundle
+    /\bjob lot\b/,           // job lot
+    /\bbundle of\b/,         // bundle of
+    /\bwholesale\b/,         // wholesale
+    /\bjob\s*lot\b/,         // job lot
+  ];
+  return junkPatterns.some(p => p.test(t));
 }
 
 // ─── Suggest — returns ONE entry per unique product type ───
@@ -65,7 +86,7 @@ app.get('/api/suggest', async (req, res) => {
       }
     );
 
-    const items = response.data.itemSummaries || [];
+    const items = (response.data.itemSummaries || []).filter(i => !isJunkListing(i.title));
 
     // Group by similar title — deduplicate aggressively
     // Strip noise words and compare first 35 chars
@@ -124,7 +145,7 @@ app.get('/api/sold', async (req, res) => {
       }
     );
 
-    const rawItems = response.data.itemSummaries || [];
+    const rawItems = (response.data.itemSummaries || []).filter(i => !isJunkListing(i.title));
 
     // Strict filter — Buy It Now only, no auctions, no best offer, AUD, AU seller
     const items = rawItems.filter(item => {
