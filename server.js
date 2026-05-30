@@ -64,7 +64,22 @@ function isJunkListing(title) {
   return junkPatterns.some(p => p.test(t));
 }
 
-// ─── Suggest — returns ONE entry per unique product type ───
+// Score how closely a listing matches the search query
+function scoreMatch(title, query) {
+  const t = title.toLowerCase();
+  const q = query.toLowerCase();
+  const qWords = q.split(' ').filter(w => w.length > 1);
+  let score = 0;
+  for (const word of qWords) { if (t.includes(word)) score += 10; }
+  if (t.startsWith(q)) score += 20;
+  if (t.includes(q)) score += 15;
+  // Penalty for junk add-ons not in the search query
+  const addons = ['dice', 'sleeves', 'coin', 'promo', 'pin', 'figure', 'plush', 'poster', 'accessory', 'badge', 'mat', 'playmat', 'binder', 'portfolio'];
+  for (const addon of addons) { if (t.includes(addon) && !q.includes(addon)) score -= 25; }
+  return score;
+}
+
+// ─── Suggest — returns best matching products only ───
 app.get('/api/suggest', async (req, res) => {
   const query = req.query.q;
   if (!query || query.length < 2) return res.json({ suggestions: [] });
@@ -76,7 +91,7 @@ app.get('/api/suggest', async (req, res) => {
         params: {
           q: `pokemon ${query}`,
           filter: AU_FILTER,
-          limit: 20,
+          limit: 25,
           sort: 'bestMatch',
         },
         headers: {
@@ -86,35 +101,34 @@ app.get('/api/suggest', async (req, res) => {
       }
     );
 
-    const items = (response.data.itemSummaries || []).filter(i => !isJunkListing(i.title));
+    const items = (response.data.itemSummaries || [])
+      .filter(i => !isJunkListing(i.title))
+      .map(i => ({ ...i, _score: scoreMatch(i.title, query) }))
+      .filter(i => i._score > 0)
+      .sort((a, b) => b._score - a._score);
 
-    // Group by similar title — deduplicate aggressively
-    // Strip noise words and compare first 35 chars
+    // Group by similar title
     const groups = {};
     for (const item of items) {
       const cleaned = cleanTitle(item.title);
       const key = cleaned.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 35);
       if (!groups[key]) {
-        groups[key] = {
-          name: cleaned,
-          prices: [],
-          image: item.image?.imageUrl || null,
-        };
+        groups[key] = { name: cleaned, prices: [], image: item.image?.imageUrl || null, score: item._score };
       }
       const price = parseFloat(item.price?.value || 0);
       if (price > 0) groups[key].prices.push(price);
     }
 
-    // Build suggestion list — one per unique product
     const suggestions = Object.values(groups)
       .filter(g => g.prices.length > 0)
+      .sort((a, b) => b.score - a.score)
       .map(g => ({
         name: g.name,
         avgPrice: (g.prices.reduce((a, b) => a + b, 0) / g.prices.length).toFixed(2),
         listings: g.prices.length,
         image: g.image,
       }))
-      .slice(0, 6);
+      .slice(0, 5);
 
     res.json({ suggestions });
   } catch (err) {
